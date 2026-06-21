@@ -176,61 +176,133 @@ app.post('/api/chat', async (req, res) => {
         // 2. JALUR UTAMA: Ekstraksi Dokumen Menggunakan RAG TF-IDF Lokal
         const allDocuments = datasetManager.getAllDocuments();
         
-        // --- PROSES PEMBERSIHAN KATA BASA-BASI (Paling Efektif untuk Pertanyaan Tidak Terstruktur) ---
+        let pesanMasuk = message.toLowerCase().trim();
+
+        // =========================================================================
+        // LAYER 1: KAMUS KOREKSI TYPO & BAHASA GAUL/SANTAI (Mencegah RAG 0 Context)
+        // =========================================================================
+        const kamusKoreksiMassal = {
+            // Koreksi Typo Vokal & Singkatan Istilah Utama
+            "yidisium": "yudisium",
+            "yudisum": "yudisium",
+            "yudis": "yudisium",
+            "eprt": "eprt toefl",
+            "epert": "eprt toefl",
+            "tofel": "eprt toefl",
+            "bpp": "bpp ukt uang kuliah",
+            "ukt": "bpp ukt uang kuliah",
+            "sksan": "sks maksimal kuota",
+            "krsan": "krs ksm registrasi",
+            "ksman": "krs ksm registrasi",
+            "doswal": "dosen wali perwalian",
+            "dosen wali": "dosen wali perwalian",
+            "skripsian": "skripsi tugas akhir ta",
+            "ta": "skripsi tugas akhir ta",
+            "kp": "kerja praktik magang wrap",
+            "internsip": "kerja praktik magang wrap",
+            "cumlaud": "cum laude pujian",
+            "comlaude": "cum laude pujian",
+            "do": "drop out sp surat peringatan",
+            "dropaut": "drop out sp surat peringatan",
+            "mangkir": "mangkir tidak aktif nonaktif",
+            "sp": "semester antara pendek sp",
+            "semester pendek": "semester antara pendek sp",
+            "lks": "laporan kemajuan studi lks",
+            "rapor": "laporan kemajuan studi lks",
+            "khs": "kartu hasil studi khs",
+            "transkrip": "transkrip akademik nilai",
+            
+            // Konversi Angka Waktu Studi & Kelulusan Cepat (Menyesuaikan Baris 38 & 43)
+            "3.5 tahun": "7 semester lulus cepat masa studi normal",
+            "3,5 tahun": "7 semester lulus cepat masa studi normal",
+            "3 setengah tahun": "7 semester lulus cepat masa studi normal",
+            "4 tahun": "8 semester masa studi normal sarjana",
+            "3 tahun": "6 semester masa studi normal diploma tiga",
+            "7 semester": "7 semester lulus cepat masa studi normal",
+            "8 semester": "8 semester masa studi normal sarjana",
+            "6 semester": "6 semester masa studi normal diploma tiga",
+            
+            // Konversi Singkatan Nilai & Skala Mutu (Menyesuaikan Baris 63 & 64)
+            "nilai minimal": "nilai huruf terendah lulus minimum",
+            "nilai kelulusan": "nilai huruf terendah lulus minimum",
+            "ngulang matkul": "nilai d atau e mengulang mata kuliah",
+            "perbaikan nilai": "nilai d atau e mengulang mata kuliah"
+        };
+
+        // Eksekusi penggantian kata berdasarkan kamus koreksi
+        for (const [salah, benar] of Object.entries(kamusKoreksiMassal)) {
+            if (pesanMasuk.includes(salah)) {
+                pesanMasuk = pesanMasuk.replace(new RegExp(`\\b${salah}\\b|${salah}`, 'g'), benar);
+            }
+        }
+
+        // =========================================================================
+        // LAYER 2: PEMBERSIHAN KATA BASA-BASI / STOPWORDS (Fokus pada Kata Inti)
+        // =========================================================================
         const kataBasaBasi = [
             "bagaimana", "apakah", "gimana", "sih", "dong", "kak", "min", "tolong", 
             "mau", "tanya", "saya", "kamu", "itu", "ini", "yang", "di", "ke", "dari", 
             "bisa", "kah", "bila", "jika", "kalau", "tentang", "mengenai", "untuk",
-            "buat", "ikut", "ada", "yang", "nanya", "ya", "kok", "nih"
+            "buat", "ikut", "ada", "nanya", "ya", "kok", "nih", "bisa", "syarat",
+            "cara", "aturan", "ketentuan", "panduan", "adalah", "apa", "biar", "supaya"
         ];
 
-        // Pisahkan kalimat berdasarkan spasi, buang kata basa-basi, lalu gabungkan kembali
-        let kataKunciInti = pesanMasuk.split(" ")
+        let kataKunciInti = pesanMasuk.split(/\s+/)
             .filter(kata => !kataBasaBasi.includes(kata))
             .join(" ");
 
-        // --- FITUR BARU: KAMUS EKSPANSI & SINONIM AKADEMIK TUS ---
-        // Mencocokkan dari kataKunciInti agar pencarian di CSV menjadi jauh lebih kaya
+        // =========================================================================
+        // LAYER 3: KAMUS EKSPANSI & SINONIM AKADEMIK MAKSIMAL (Penjaringan RAG)
+        // =========================================================================
         let queryDibersihkan = kataKunciInti;
-        const kamusEkspansi = {
-            "eprt": "eprt toefl bahasa asing skor nilai minimum kelulusan",
-            "tak": "tak transkrip aktivitas kemahasiswaan poin minimal",
-            "yudisium": "yudisium sidang kelulusan ijazah skl fakultas rektor",
-            "wisuda": "syarat lulus kelulusan wisuda ukt lunas publikasi ta",
-            "skripsi": "tugas akhir ta skripsi sidang proposal pembimbing",
-            "ta": "tugas akhir ta skripsi sidang proposal pembimbing",
-            "kp": "magang kerja praktik kp wrap internship",
-            "magang": "magang kerja praktik kp wrap internship",
-            "cuti": "cuti akademik nonaktif bpp status 10 persen tingkat 1",
-            "sks": "beban belajar sks maksimal kuota ip ips ambil krs",
-            "krs": "krs ksm registrasi daftar ulang ukt ksm cetak",
-            "sp": "semester antara pendek sp remedial kelas perkuliahan",
-            "do": "drop out sp surat peringatan evaluasi tingkat do"
+        const kamusEkspansiMaksimal = {
+            "eprt": "eprt toefl ielts kecakapan bahasa inggris skor nilai minimum kelulusan lulus",
+            "toefl": "eprt toefl ielts kecakapan bahasa inggris skor nilai minimum kelulusan lulus",
+            "tak": "tak transkrip aktivitas kemahasiswaan poin minimal organisasi sertifikat",
+            "yudisium": "yudisium dekan sidang penetapan kelulusan ijazah skl fakultas rektor",
+            "wisuda": "syarat lulus kelulusan wisuda ukt lunas publikasi ta ijazah transkrip",
+            "skripsi": "tugas akhir ta skripsi skripsian sidang proposal pembimbing artikel ilmiah",
+            "ta": "tugas akhir ta skripsi skripsian sidang proposal pembimbing artikel ilmiah",
+            "kp": "magang kerja praktik kp wrap internship kerja industri",
+            "magang": "magang kerja praktik kp wrap internship kerja industri",
+            "cuti": "cuti akademik nonaktif bpp status 10 persen tingkat 1 izin pimpinan upps",
+            "sks": "beban belajar sks maksimal kuota ip ips ambil krs semester",
+            "krs": "krs ksm registrasi daftar ulang ukt ksm cetak awal semester",
+            "sp": "semester antara pendek sp remedial kelas perkuliahan memperbaiki nilai 9 sks",
+            "do": "drop out sp surat peringatan evaluasi tingkat do spa sanksi akademik",
+            "nilai": "skala nilai bobot indeks mutu konversi a ab b bc c d e terendah",
+            "lks": "laporan kemajuan studi lks orang tua broadcast nilai evaluasi",
+            "fast track": "fast track skema studi percepatan sarjana magister 10 semester ipk 3.25"
         };
 
-        // Cek jika kueri mengandung komponen kata kunci populer, lalu gabungkan kekayaan katanya
-        for (const [singkatan, deskripsiPanjang] of Object.entries(kamusEkspansi)) {
+        // Satukan kekuatan ekspansi kata kunci agar kueri ke RAG menjadi sangat kaya frasa
+        for (const [singkatan, deskripsiPanjang] of Object.entries(kamusEkspansiMaksimal)) {
             if (pesanMasuk.includes(singkatan) || queryDibersihkan.includes(singkatan)) {
                 queryDibersihkan = `${queryDibersihkan} ${deskripsiPanjang}`;
             }
         }
 
-        // Ambil riwayat chat terakhir untuk digabungkan ke query agar memahami kata konteks lanjutan
+        // =========================================================================
+        // LAYER 4: PENYELARASAN RIWAYAT CONTEXT (Contextual Chat Awareness)
+        // =========================================================================
         let history = chatHistories.get(activeUserId) || [];
         if (history.length > 0) {
             const lastUserMsg = history[history.length - 2]?.content || "";
-            const cleanedLastMsg = lastUserMsg.toLowerCase().split(" ").filter(k => !kataBasaBasi.includes(k)).join(" ");
+            const cleanedLastMsg = lastUserMsg.toLowerCase().split(/\s+/).filter(k => !kataBasaBasi.includes(k)).join(" ");
             queryDibersihkan = `${cleanedLastMsg} ${queryDibersihkan}`;
         }
 
-        // Lakukan pencarian ke dataset CSV menggunakan query yang sudah dibersihkan & diekspansi
+        // Pembersihan spasi ganda sebelum dimasukkan ke mesin RAG
+        queryDibersihkan = queryDibersihkan.replace(/\s+/g, ' ').trim();
+
+        // Cari ke dataset CSV baru menggunakan kueri multi-layer dengan target cakupan luas (Top 6)
         const contextItems = ragEngine.retrieveContext(
             queryDibersihkan,
             allDocuments,
-            Number(process.env.RAG_TOP_K || 3)
+            Number(process.env.RAG_TOP_K || 6) // Diatur ke 6 agar potongan aturan komprehensif tertangkap semua
         );
         
-        console.log(`[Web Chat] RAG Final Query: "${queryDibersihkan}" -> Retrieved ${contextItems.length} context(s)`);
+        console.log(`[Web Chat] RAG Final Extracted Query: "${queryDibersihkan}" -> Retrieved ${contextItems.length} context(s)`);
         
         // 3. JIKA CONTEXT DITEMUKAN / JALUR GROQ LLM
         const timeoutPromise = new Promise((_, reject) =>
