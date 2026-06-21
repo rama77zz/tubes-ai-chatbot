@@ -76,37 +76,184 @@ function saveBehavior(obj) {
     }
 }
 
+function getDefaultBehavior() {
+    return {
+        system_instructions: 'Jawab berdasarkan konteks.',
+        fallback_response: 'Mohon maaf, informasi spesifik mengenai hal tersebut belum tercatat di sistem pedoman akademik kami. Silakan hubungi bagian Sekretariat Kampus atau Layanan Mahasiswa untuk info lebih lanjut.',
+        max_sentences: 4,
+        language: 'id'
+    };
+}
+
+// =========================================================================
+// KAMUS KOREKSI TYPO & BAHASA GAUL/SANTAI (Mencegah RAG 0 Context)
+// Dipindah ke level module supaya tidak dibuat ulang setiap request,
+// dan supaya bisa dipakai bersama oleh beberapa fungsi.
+// =========================================================================
+const kamusKoreksiMassal = {
+    "yidisium": "yudisium",
+    "yudisum": "yudisium",
+    "yudis": "yudisium",
+    "eprt": "eprt toefl",
+    "epert": "eprt toefl",
+    "tofel": "eprt toefl",
+    "bpp": "bpp ukt uang kuliah",
+    "ukt": "bpp ukt uang kuliah",
+    "sksan": "sks maksimal kuota",
+    "krsan": "krs ksm registrasi",
+    "ksman": "krs ksm registrasi",
+    "doswal": "dosen wali perwalian",
+    "dosen wali": "dosen wali perwalian",
+    "skripsian": "skripsi tugas akhir ta",
+    "kp": "kerja praktik magang wrap",
+    "internsip": "kerja praktik magang wrap",
+    "cumlaud": "cum laude pujian",
+    "comlaude": "cum laude pujian",
+    "dropaut": "drop out sp surat peringatan",
+    "mangkir": "mangkir tidak aktif nonaktif",
+    "semester pendek": "semester antara pendek sp",
+    "lks": "laporan kemajuan studi lks",
+    "rapor": "laporan kemajuan studi lks",
+    "khs": "kartu hasil studi khs",
+    "transkrip": "transkrip akademik nilai",
+    "3.5 tahun": "7 semester lulus cepat masa studi normal",
+    "3,5 tahun": "7 semester lulus cepat masa studi normal",
+    "3 setengah tahun": "7 semester lulus cepat masa studi normal",
+    "4 tahun": "8 semester masa studi normal sarjana",
+    "3 tahun": "6 semester masa studi normal diploma tiga",
+    "7 semester": "7 semester lulus cepat masa studi normal",
+    "8 semester": "8 semester masa studi normal sarjana",
+    "6 semester": "6 semester masa studi normal diploma tiga",
+    "nilai minimal": "nilai huruf terendah lulus minimum",
+    "nilai kelulusan": "nilai huruf terendah lulus minimum",
+    "ngulang matkul": "nilai d atau e mengulang mata kuliah",
+    "perbaikan nilai": "nilai d atau e mengulang mata kuliah"
+};
+
+// Catatan: "ta" dan "sp" SENGAJA TIDAK dimasukkan ke kamus di atas sebagai key
+// tunggal karena terlalu pendek & ambigu (bisa muncul sebagai pecahan kata lain
+// saat replace), beda dengan kataBasaBasi yang dicek per-kata utuh.
+
+const kataBasaBasi = [
+    "bagaimana", "apakah", "gimana", "sih", "dong", "kak", "min", "tolong",
+    "mau", "tanya", "saya", "kamu", "itu", "ini", "yang", "di", "ke", "dari",
+    "bisa", "kah", "bila", "jika", "kalau", "tentang", "mengenai", "untuk",
+    "buat", "ikut", "ada", "nanya", "ya", "kok", "nih", "syarat",
+    "cara", "aturan", "ketentuan", "panduan", "adalah", "apa", "biar", "supaya"
+];
+
+const kamusEkspansiMaksimal = {
+    "eprt": "eprt toefl ielts kecakapan bahasa inggris skor nilai minimum kelulusan lulus",
+    "toefl": "eprt toefl ielts kecakapan bahasa inggris skor nilai minimum kelulusan lulus",
+    "tak": "tak transkrip aktivitas kemahasiswaan poin minimal organisasi sertifikat",
+    "yudisium": "yudisium dekan sidang penetapan kelulusan ijazah skl fakultas rektor",
+    "wisuda": "syarat lulus kelulusan wisuda ukt lunas publikasi ta ijazah transkrip",
+    "skripsi": "tugas akhir ta skripsi skripsian sidang proposal pembimbing artikel ilmiah",
+    "kp": "magang kerja praktik kp wrap internship kerja industri",
+    "magang": "magang kerja praktik kp wrap internship kerja industri",
+    "cuti": "cuti akademik nonaktif bpp status 10 persen tingkat 1 izin pimpinan upps",
+    "sks": "beban belajar sks maksimal kuota ip ips ambil krs semester",
+    "krs": "krs ksm registrasi daftar ulang ukt ksm cetak awal semester",
+    "do": "drop out sp surat peringatan evaluasi tingkat do spa sanksi akademik",
+    "nilai": "skala nilai bobot indeks mutu konversi a ab b bc c d e terendah",
+    "lks": "laporan kemajuan studi lks orang tua broadcast nilai evaluasi",
+    "fast track": "fast track skema studi percepatan sarjana magister 10 semester ipk 3.25"
+};
+
 /**
- * Memproses pesan ke API Groq menggunakan Konteks RAG dan Riwayat Obrolan
+ * Memproses satu pesan mentah jadi query RAG yang kaya (typo correction,
+ * stopword removal, ekspansi sinonim, dan penyelarasan riwayat percakapan).
+ * Dipisah jadi fungsi sendiri supaya tidak ada duplikasi variabel/logic
+ * seperti pada versi sebelumnya, dan supaya gampang diuji terpisah.
  */
-async function getAIResponse(message, contextItems = [], behavior = null, userId) {
+function buildEnrichedQuery(rawMessage, activeUserId) {
+    let pesanMasuk = rawMessage.toLowerCase().trim();
+
+    // LAYER 1: Koreksi typo & bahasa gaul
+    for (const [salah, benar] of Object.entries(kamusKoreksiMassal)) {
+        if (pesanMasuk.includes(salah)) {
+            const pattern = salah.includes(' ')
+                ? salah.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+                : `\\b${salah}\\b`;
+            pesanMasuk = pesanMasuk.replace(new RegExp(pattern, 'g'), benar);
+        }
+    }
+
+    // LAYER 2: Pembersihan stopword
+    const kataKunciInti = pesanMasuk
+        .split(/\s+/)
+        .filter(kata => !kataBasaBasi.includes(kata))
+        .join(' ');
+
+    // LAYER 3: Ekspansi sinonim akademik
+    let queryDibersihkan = kataKunciInti;
+    for (const [singkatan, deskripsiPanjang] of Object.entries(kamusEkspansiMaksimal)) {
+        if (pesanMasuk.includes(singkatan) || queryDibersihkan.includes(singkatan)) {
+            queryDibersihkan = `${queryDibersihkan} ${deskripsiPanjang}`;
+        }
+    }
+
+    // LAYER 4: Penyelarasan dengan riwayat chat (biar nyambung kalau user nanya lanjutan)
+    const history = chatHistories.get(activeUserId) || [];
+    if (history.length > 0) {
+        const lastUserMsg = history[history.length - 2]?.content || '';
+        const cleanedLastMsg = lastUserMsg
+            .toLowerCase()
+            .split(/\s+/)
+            .filter(k => !kataBasaBasi.includes(k))
+            .join(' ');
+        queryDibersihkan = `${cleanedLastMsg} ${queryDibersihkan}`;
+    }
+
+    return queryDibersihkan.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Mencoba mencocokkan pesan ke knowledge.json (FAQ kaku: sapaan, terima kasih, dll).
+ * Word-boundary match untuk kata tunggal, substring match untuk frasa multi-kata.
+ */
+function matchKnowledgeBase(pesanMasuk, knowledge) {
+    if (!knowledge.keywords || !knowledge.responses) return null;
+
+    const potonganKataUser = pesanMasuk.split(/\s+/);
+
+    for (const [kunciUtama, daftarKata] of Object.entries(knowledge.keywords)) {
+        const adaMencocok = daftarKata.some(kataDariJson => {
+            if (kataDariJson.includes(' ')) {
+                return pesanMasuk.includes(kataDariJson);
+            }
+            return potonganKataUser.includes(kataDariJson);
+        });
+
+        if (adaMencocok) {
+            return knowledge.responses[kunciUtama];
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Memproses pesan ke API Groq menggunakan Konteks RAG dan Riwayat Obrolan.
+ * PENTING: fallback_response TIDAK diserahkan ke LLM untuk "diucapkan ulang" --
+ * itu rawan diparafrase/diabaikan oleh model kecil. Kalau context kosong,
+ * server-v2.js akan langsung balas fallback_response tanpa memanggil fungsi ini
+ * sama sekali (lihat endpoint /api/chat). Fungsi ini hanya dipanggil ketika
+ * context RAG memang ada isinya.
+ */
+async function getAIResponse(message, contextItems, behavior, userId) {
     try {
         const contextBlock = ragEngine.buildContextBlock(contextItems);
-        if (!behavior) {
-            behavior = loadBehavior() || {
-                system_instructions: 'Jawab berdasarkan konteks.',
-                fallback_response: 'Mohon maaf, data tidak ditemukan.',
-                max_sentences: 2,
-                language: 'id'
-            };
-        }
-
-        const contextText = contextItems.length > 0 
-            ? `\n\nKonteks Dokumen Akademik TUS Resmi:\n${contextBlock}` 
-            : `\n\nKonteks Dokumen Akademik TUS: [Tidak ada aturan akademik spesifik yang relevan dengan pertanyaan mahasiswa saat ini]`;
 
         const systemParts = [];
         if (behavior.system_instructions) systemParts.push(behavior.system_instructions);
-        
-        systemParts.push(`\nPanduan Ekstra: Jika pertanyaan menanyakan produk atau hal yang tidak ada di Konteks Data Akademik, katakan: "${behavior.fallback_response}"`);
-        systemParts.push(`Jawab maksimal ${behavior.max_sentences || 3} kalimat. Bahasa: ${behavior.language || 'id'}.`);
-        
-        const systemMessage = systemParts.join(' ') + contextText;
+        systemParts.push(`Jawab HANYA berdasarkan Konteks Dokumen Akademik di bawah ini. Jangan mengarang informasi yang tidak ada di konteks.`);
+        systemParts.push(`Jawab maksimal ${behavior.max_sentences || 4} kalimat. Bahasa: ${behavior.language || 'id'}.`);
 
-        // Ambil riwayat obrolan sebelumnya untuk pengguna web ini
+        const systemMessage = `${systemParts.join(' ')}\n\nKonteks Dokumen Akademik TUS Resmi:\n${contextBlock}`;
+
         let history = chatHistories.get(userId) || [];
 
-        // Siapkan array messages untuk Groq
         const messages = [
             { role: 'system', content: systemMessage },
             ...history,
@@ -122,15 +269,13 @@ async function getAIResponse(message, contextItems = [], behavior = null, userId
 
         const aiResponseText = completion.choices[0].message.content;
 
-        // Simpan pesan saat ini ke riwayat obrolan lokal memori
         history.push({ role: 'user', content: message });
         history.push({ role: 'assistant', content: aiResponseText });
 
-        // Batasi memori hanya 10 pesan terakhir (5 tanya, 5 jawab) agar tidak bengkak
         if (history.length > 10) {
             history = history.slice(history.length - 10);
         }
-        
+
         chatHistories.set(userId, history);
 
         return aiResponseText;
@@ -138,6 +283,21 @@ async function getAIResponse(message, contextItems = [], behavior = null, userId
         console.error('Error getting AI response:', error.message);
         return null;
     }
+}
+
+/**
+ * Menyimpan giliran fallback ke riwayat juga, supaya chatHistories tetap
+ * konsisten merepresentasikan percakapan (termasuk saat bot fallback),
+ * dan supaya Layer 4 (penyelarasan riwayat) tidak nyasar ke giliran lama.
+ */
+function recordFallbackTurn(userId, userMessage, fallbackText) {
+    let history = chatHistories.get(userId) || [];
+    history.push({ role: 'user', content: userMessage });
+    history.push({ role: 'assistant', content: fallbackText });
+    if (history.length > 10) {
+        history = history.slice(history.length - 10);
+    }
+    chatHistories.set(userId, history);
 }
 
 // ====================================================================
@@ -148,208 +308,77 @@ app.post('/api/chat', async (req, res) => {
         const { message, userId } = req.body;
         const activeUserId = userId || 'default-web-user';
 
-        if (!message || message.trim() === "") {
+        if (!message || message.trim() === '') {
             return res.status(400).json({ error: 'Pesan tidak boleh kosong', success: false });
         }
 
         console.log(`[Web Message] User (${activeUserId}): ${message}`);
 
-       const knowledge = loadKnowledge();
-        let pesanMasuk = message.toLowerCase().trim(); 
-        let faqResponse = null;
+        const knowledge = loadKnowledge();
+        const pesanMasuk = message.toLowerCase().trim();
 
-        // =========================================================================
-        // 1. GARDA TERDEPAN: Cek Kata Kunci Kaku (DIPERBAIKI: Menggunakan Word Matching)
-        // =========================================================================
-        if (knowledge.keywords && knowledge.responses) {
-            // Pecah pesan masuk menjadi array kata-kata individual untuk dicocokkan secara utuh
-            const potonganKataUser = pesanMasuk.split(/\s+/);
-
-            for (const [kunciUtama, daftarKata] of Object.entries(knowledge.keywords)) {
-                // Memastikan kata dari knowledge.json cocok secara UTUH, bukan part-of-word
-                const adaMencocok = daftarKata.some(kataDariJson => {
-                    // Jika kata kunci di JSON berupa frasa (lebih dari 1 kata, misal: "jam buka")
-                    if (kataDariJson.includes(" ")) {
-                        return pesanMasuk.includes(kataDariJson);
-                    }
-                    // Jika kata kunci tunggal (misal: "p", "halo"), cek keterpakaian kata secara utuh
-                    return potonganKataUser.includes(kataDariJson);
-                });
-
-                if (adaMencocok) {
-                    faqResponse = knowledge.responses[kunciUtama];
-                    break;
-                }
-            }
-        }
-
+        // =====================================================================
+        // 1. GARDA TERDEPAN: Cek Kata Kunci Kaku (FAQ: sapaan, terima kasih, dll)
+        // =====================================================================
+        const faqResponse = matchKnowledgeBase(pesanMasuk, knowledge);
         if (faqResponse) {
-            console.log(`[Web Chat] Match via knowledge.json`);
+            console.log('[Web Chat] Match via knowledge.json');
+            recordFallbackTurn(activeUserId, message, faqResponse);
             return res.json({ reply: faqResponse, source: 'FAQ Direct Match' });
         }
 
-        // =========================================================================
+        // =====================================================================
         // 2. JALUR UTAMA: Ekstraksi Dokumen Menggunakan RAG TF-IDF Lokal
-        // =========================================================================
+        // =====================================================================
         const allDocuments = datasetManager.getAllDocuments();
-        
-        // ... (Sisa kode Layer 1 Kamus Koreksi, Layer 2 Stopwords, Layer 3 Ekspansi ke bawah tetap sama) ...
-        
-        let pesanMasuk = message.toLowerCase().trim();
+        const queryDibersihkan = buildEnrichedQuery(message, activeUserId);
 
-        // =========================================================================
-        // LAYER 1: KAMUS KOREKSI TYPO & BAHASA GAUL/SANTAI (Mencegah RAG 0 Context)
-        // =========================================================================
-        const kamusKoreksiMassal = {
-            // Koreksi Typo Vokal & Singkatan Istilah Utama
-            "yidisium": "yudisium",
-            "yudisum": "yudisium",
-            "yudis": "yudisium",
-            "eprt": "eprt toefl",
-            "epert": "eprt toefl",
-            "tofel": "eprt toefl",
-            "bpp": "bpp ukt uang kuliah",
-            "ukt": "bpp ukt uang kuliah",
-            "sksan": "sks maksimal kuota",
-            "krsan": "krs ksm registrasi",
-            "ksman": "krs ksm registrasi",
-            "doswal": "dosen wali perwalian",
-            "dosen wali": "dosen wali perwalian",
-            "skripsian": "skripsi tugas akhir ta",
-            "ta": "skripsi tugas akhir ta",
-            "kp": "kerja praktik magang wrap",
-            "internsip": "kerja praktik magang wrap",
-            "cumlaud": "cum laude pujian",
-            "comlaude": "cum laude pujian",
-            "do": "drop out sp surat peringatan",
-            "dropaut": "drop out sp surat peringatan",
-            "mangkir": "mangkir tidak aktif nonaktif",
-            "sp": "semester antara pendek sp",
-            "semester pendek": "semester antara pendek sp",
-            "lks": "laporan kemajuan studi lks",
-            "rapor": "laporan kemajuan studi lks",
-            "khs": "kartu hasil studi khs",
-            "transkrip": "transkrip akademik nilai",
-            
-            // Konversi Angka Waktu Studi & Kelulusan Cepat (Menyesuaikan Baris 38 & 43)
-            "3.5 tahun": "7 semester lulus cepat masa studi normal",
-            "3,5 tahun": "7 semester lulus cepat masa studi normal",
-            "3 setengah tahun": "7 semester lulus cepat masa studi normal",
-            "4 tahun": "8 semester masa studi normal sarjana",
-            "3 tahun": "6 semester masa studi normal diploma tiga",
-            "7 semester": "7 semester lulus cepat masa studi normal",
-            "8 semester": "8 semester masa studi normal sarjana",
-            "6 semester": "6 semester masa studi normal diploma tiga",
-            
-            // Konversi Singkatan Nilai & Skala Mutu (Menyesuaikan Baris 63 & 64)
-            "nilai minimal": "nilai huruf terendah lulus minimum",
-            "nilai kelulusan": "nilai huruf terendah lulus minimum",
-            "ngulang matkul": "nilai d atau e mengulang mata kuliah",
-            "perbaikan nilai": "nilai d atau e mengulang mata kuliah"
-        };
-
-        // Eksekusi penggantian kata berdasarkan kamus koreksi
-        for (const [salah, benar] of Object.entries(kamusKoreksiMassal)) {
-            if (pesanMasuk.includes(salah)) {
-                pesanMasuk = pesanMasuk.replace(new RegExp(`\\b${salah}\\b|${salah}`, 'g'), benar);
-            }
-        }
-
-        // =========================================================================
-        // LAYER 2: PEMBERSIHAN KATA BASA-BASI / STOPWORDS (Fokus pada Kata Inti)
-        // =========================================================================
-        const kataBasaBasi = [
-            "bagaimana", "apakah", "gimana", "sih", "dong", "kak", "min", "tolong", 
-            "mau", "tanya", "saya", "kamu", "itu", "ini", "yang", "di", "ke", "dari", 
-            "bisa", "kah", "bila", "jika", "kalau", "tentang", "mengenai", "untuk",
-            "buat", "ikut", "ada", "nanya", "ya", "kok", "nih", "bisa", "syarat",
-            "cara", "aturan", "ketentuan", "panduan", "adalah", "apa", "biar", "supaya"
-        ];
-
-        let kataKunciInti = pesanMasuk.split(/\s+/)
-            .filter(kata => !kataBasaBasi.includes(kata))
-            .join(" ");
-
-        // =========================================================================
-        // LAYER 3: KAMUS EKSPANSI & SINONIM AKADEMIK MAKSIMAL (Penjaringan RAG)
-        // =========================================================================
-        let queryDibersihkan = kataKunciInti;
-        const kamusEkspansiMaksimal = {
-            "eprt": "eprt toefl ielts kecakapan bahasa inggris skor nilai minimum kelulusan lulus",
-            "toefl": "eprt toefl ielts kecakapan bahasa inggris skor nilai minimum kelulusan lulus",
-            "tak": "tak transkrip aktivitas kemahasiswaan poin minimal organisasi sertifikat",
-            "yudisium": "yudisium dekan sidang penetapan kelulusan ijazah skl fakultas rektor",
-            "wisuda": "syarat lulus kelulusan wisuda ukt lunas publikasi ta ijazah transkrip",
-            "skripsi": "tugas akhir ta skripsi skripsian sidang proposal pembimbing artikel ilmiah",
-            "ta": "tugas akhir ta skripsi skripsian sidang proposal pembimbing artikel ilmiah",
-            "kp": "magang kerja praktik kp wrap internship kerja industri",
-            "magang": "magang kerja praktik kp wrap internship kerja industri",
-            "cuti": "cuti akademik nonaktif bpp status 10 persen tingkat 1 izin pimpinan upps",
-            "sks": "beban belajar sks maksimal kuota ip ips ambil krs semester",
-            "krs": "krs ksm registrasi daftar ulang ukt ksm cetak awal semester",
-            "sp": "semester antara pendek sp remedial kelas perkuliahan memperbaiki nilai 9 sks",
-            "do": "drop out sp surat peringatan evaluasi tingkat do spa sanksi akademik",
-            "nilai": "skala nilai bobot indeks mutu konversi a ab b bc c d e terendah",
-            "lks": "laporan kemajuan studi lks orang tua broadcast nilai evaluasi",
-            "fast track": "fast track skema studi percepatan sarjana magister 10 semester ipk 3.25"
-        };
-
-        // Satukan kekuatan ekspansi kata kunci agar kueri ke RAG menjadi sangat kaya frasa
-        for (const [singkatan, deskripsiPanjang] of Object.entries(kamusEkspansiMaksimal)) {
-            if (pesanMasuk.includes(singkatan) || queryDibersihkan.includes(singkatan)) {
-                queryDibersihkan = `${queryDibersihkan} ${deskripsiPanjang}`;
-            }
-        }
-
-        // =========================================================================
-        // LAYER 4: PENYELARASAN RIWAYAT CONTEXT (Contextual Chat Awareness)
-        // =========================================================================
-        let history = chatHistories.get(activeUserId) || [];
-        if (history.length > 0) {
-            const lastUserMsg = history[history.length - 2]?.content || "";
-            const cleanedLastMsg = lastUserMsg.toLowerCase().split(/\s+/).filter(k => !kataBasaBasi.includes(k)).join(" ");
-            queryDibersihkan = `${cleanedLastMsg} ${queryDibersihkan}`;
-        }
-
-        // Pembersihan spasi ganda sebelum dimasukkan ke mesin RAG
-        queryDibersihkan = queryDibersihkan.replace(/\s+/g, ' ').trim();
-
-        // Cari ke dataset CSV baru menggunakan kueri multi-layer dengan target cakupan luas (Top 6)
         const contextItems = ragEngine.retrieveContext(
             queryDibersihkan,
             allDocuments,
-            Number(process.env.RAG_TOP_K || 6) // Diatur ke 6 agar potongan aturan komprehensif tertangkap semua
+            Number(process.env.RAG_TOP_K || 6)
         );
-        
+
         console.log(`[Web Chat] RAG Final Extracted Query: "${queryDibersihkan}" -> Retrieved ${contextItems.length} context(s)`);
-        
-        // 3. JIKA CONTEXT DITEMUKAN / JALUR GROQ LLM
+
+        const behavior = loadBehavior() || getDefaultBehavior();
+
+        // =====================================================================
+        // 3. KONTEKS KOSONG -> langsung balas fallback yang KONSISTEN,
+        //    tanpa memanggil Groq sama sekali. Ini mencegah LLM mengarang
+        //    kalimat fallback sendiri (yang sebelumnya menyebabkan respons
+        //    tidak konsisten seperti di screenshot).
+        // =====================================================================
+        if (contextItems.length === 0) {
+            console.log('[Web Chat] Context kosong -> fallback langsung (tanpa panggil Groq)');
+            recordFallbackTurn(activeUserId, message, behavior.fallback_response);
+            return res.json({ reply: behavior.fallback_response, source: 'No Context Fallback' });
+        }
+
+        // =====================================================================
+        // 4. CONTEXT DITEMUKAN -> tanya Groq dengan timeout guard
+        // =====================================================================
         const timeoutPromise = new Promise((_, reject) =>
             setTimeout(() => reject(new Error('AI response timeout')), 20000)
         );
-        
+
         try {
-            const behavior = loadBehavior();
-            
             const aiResponse = await Promise.race([
                 getAIResponse(message, contextItems, behavior, activeUserId),
                 timeoutPromise
             ]);
 
-            if (aiResponse && aiResponse.trim() !== "") {
+            if (aiResponse && aiResponse.trim() !== '') {
                 return res.json({ reply: aiResponse, source: 'RAG Engine + Groq AI' });
-            } else {
-                return res.json({ 
-                    reply: 'Mohon maaf, saya belum menemukan aturan spesifik mengenai hal tersebut di buku pedoman akademik saat ini. Bisa tolong berikan kata kunci yang lebih jelas?', 
-                    source: 'Safe Fallback' 
-                });
             }
+
+            const safeFallback = 'Mohon maaf, saya belum menemukan aturan spesifik mengenai hal tersebut di buku pedoman akademik saat ini. Bisa tolong berikan kata kunci yang lebih jelas?';
+            recordFallbackTurn(activeUserId, message, safeFallback);
+            return res.json({ reply: safeFallback, source: 'Safe Fallback' });
         } catch (aiError) {
             console.error('AI Processing Error:', aiError.message);
-            return res.json({ 
-                reply: 'Maaf, sistem AI sedang mengalami antrean komputasi. Silakan coba kirimkan ulang pertanyaan Anda.', 
-                source: 'Timeout Fallback' 
-            });
+            const timeoutFallback = 'Maaf, sistem AI sedang mengalami antrean komputasi. Silakan coba kirimkan ulang pertanyaan Anda.';
+            return res.json({ reply: timeoutFallback, source: 'Timeout Fallback' });
         }
     } catch (error) {
         console.error('API Chat Error:', error.message);
@@ -369,7 +398,9 @@ app.get('/api/datasets', (req, res) => {
 });
 
 app.get('/api/datasets/:name', (req, res) => {
-    const docs = datasetManager.getDatasetDocuments(req.params.name);
+    const docs = datasetManager.getDatasetDocuments
+        ? datasetManager.getDatasetDocuments(req.params.name)
+        : [];
     if (docs.length === 0) {
         return res.status(404).json({ message: 'Dataset tidak ditemukan' });
     }
@@ -381,6 +412,9 @@ app.post('/api/datasets', (req, res) => {
         const { name, data } = req.body;
         if (!name || !data) {
             return res.status(400).json({ message: 'name dan data harus diisi' });
+        }
+        if (!datasetManager.saveDataset) {
+            return res.status(501).json({ message: 'saveDataset belum diimplementasikan di DatasetManager' });
         }
         const result = datasetManager.saveDataset(name, data);
         res.json(result);
@@ -456,13 +490,12 @@ app.post('/api/behavior', (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`=========================================`);
-    console.log(`Server BERJALAN murni berbasis Website.`);
+    console.log('=========================================');
+    console.log('Server BERJALAN murni berbasis Website.');
     console.log(`Akses Chat App: http://localhost:${PORT}`);
     console.log(`Akses Panel Admin: http://localhost:${PORT}/admin.html`);
-    console.log(`=========================================`);
-    
-    // Membangun indeks peta TF-IDF lokal saat server pertama kali menyala (Instan < 1 detik)
+    console.log('=========================================');
+
     const activeDocs = datasetManager.getAllDocuments();
     ragEngine.buildVectorIndex(activeDocs);
     console.log(`Datasets loaded: ${datasetManager.listDatasets().length} file CSV.`);
