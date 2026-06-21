@@ -154,27 +154,46 @@ app.post('/api/chat', async (req, res) => {
 
         console.log(`[Web Message] User (${activeUserId}): ${message}`);
 
-        const knowledge = loadKnowledge();
-        const pesanMasuk = message.toLowerCase().trim();
+       const knowledge = loadKnowledge();
+        let pesanMasuk = message.toLowerCase().trim(); 
         let faqResponse = null;
 
-        // 1. GARDA TERDEPAN: Cek Kata Kunci Kaku Singkat (Sapaan/Terimakasih/Jam Kerja)
+        // =========================================================================
+        // 1. GARDA TERDEPAN: Cek Kata Kunci Kaku (DIPERBAIKI: Menggunakan Word Matching)
+        // =========================================================================
         if (knowledge.keywords && knowledge.responses) {
+            // Pecah pesan masuk menjadi array kata-kata individual untuk dicocokkan secara utuh
+            const potonganKataUser = pesanMasuk.split(/\s+/);
+
             for (const [kunciUtama, daftarKata] of Object.entries(knowledge.keywords)) {
-                if (daftarKata.some(kata => pesanMasuk.includes(kata))) {
+                // Memastikan kata dari knowledge.json cocok secara UTUH, bukan part-of-word
+                const adaMencocok = daftarKata.some(kataDariJson => {
+                    // Jika kata kunci di JSON berupa frasa (lebih dari 1 kata, misal: "jam buka")
+                    if (kataDariJson.includes(" ")) {
+                        return pesanMasuk.includes(kataDariJson);
+                    }
+                    // Jika kata kunci tunggal (misal: "p", "halo"), cek keterpakaian kata secara utuh
+                    return potonganKataUser.includes(kataDariJson);
+                });
+
+                if (adaMencocok) {
                     faqResponse = knowledge.responses[kunciUtama];
                     break;
                 }
             }
         }
 
-      if (faqResponse) {
+        if (faqResponse) {
             console.log(`[Web Chat] Match via knowledge.json`);
             return res.json({ reply: faqResponse, source: 'FAQ Direct Match' });
         }
 
+        // =========================================================================
         // 2. JALUR UTAMA: Ekstraksi Dokumen Menggunakan RAG TF-IDF Lokal
+        // =========================================================================
         const allDocuments = datasetManager.getAllDocuments();
+        
+        // ... (Sisa kode Layer 1 Kamus Koreksi, Layer 2 Stopwords, Layer 3 Ekspansi ke bawah tetap sama) ...
         
         let pesanMasuk = message.toLowerCase().trim();
 
