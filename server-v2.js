@@ -168,7 +168,7 @@ app.post('/api/chat', async (req, res) => {
             }
         }
 
-        if (faqResponse) {
+      if (faqResponse) {
             console.log(`[Web Chat] Match via knowledge.json`);
             return res.json({ reply: faqResponse, source: 'FAQ Direct Match' });
         }
@@ -176,9 +176,22 @@ app.post('/api/chat', async (req, res) => {
         // 2. JALUR UTAMA: Ekstraksi Dokumen Menggunakan RAG TF-IDF Lokal
         const allDocuments = datasetManager.getAllDocuments();
         
+        // --- PROSES PEMBERSIHAN KATA BASA-BASI (Paling Efektif untuk Pertanyaan Tidak Terstruktur) ---
+        const kataBasaBasi = [
+            "bagaimana", "apakah", "gimana", "sih", "dong", "kak", "min", "tolong", 
+            "mau", "tanya", "saya", "kamu", "itu", "ini", "yang", "di", "ke", "dari", 
+            "bisa", "kah", "bila", "jika", "kalau", "tentang", "mengenai", "untuk",
+            "buat", "ikut", "ada", "yang", "nanya", "ya", "kok", "nih"
+        ];
+
+        // Pisahkan kalimat berdasarkan spasi, buang kata basa-basi, lalu gabungkan kembali
+        let kataKunciInti = pesanMasuk.split(" ")
+            .filter(kata => !kataBasaBasi.includes(kata))
+            .join(" ");
+
         // --- FITUR BARU: KAMUS EKSPANSI & SINONIM AKADEMIK TUS ---
-        // Ini memastikan jika mahasiswa mengetik kata kunci pendek, sistem memperluas pencarian di CSV
-        let queryDibersihkan = pesanMasuk;
+        // Mencocokkan dari kataKunciInti agar pencarian di CSV menjadi jauh lebih kaya
+        let queryDibersihkan = kataKunciInti;
         const kamusEkspansi = {
             "eprt": "eprt toefl bahasa asing skor nilai minimum kelulusan",
             "tak": "tak transkrip aktivitas kemahasiswaan poin minimal",
@@ -197,7 +210,7 @@ app.post('/api/chat', async (req, res) => {
 
         // Cek jika kueri mengandung komponen kata kunci populer, lalu gabungkan kekayaan katanya
         for (const [singkatan, deskripsiPanjang] of Object.entries(kamusEkspansi)) {
-            if (queryDibersihkan.includes(singkatan)) {
+            if (pesanMasuk.includes(singkatan) || queryDibersihkan.includes(singkatan)) {
                 queryDibersihkan = `${queryDibersihkan} ${deskripsiPanjang}`;
             }
         }
@@ -206,17 +219,18 @@ app.post('/api/chat', async (req, res) => {
         let history = chatHistories.get(activeUserId) || [];
         if (history.length > 0) {
             const lastUserMsg = history[history.length - 2]?.content || "";
-            queryDibersihkan = `${lastUserMsg.toLowerCase()} ${queryDibersihkan}`;
+            const cleanedLastMsg = lastUserMsg.toLowerCase().split(" ").filter(k => !kataBasaBasi.includes(k)).join(" ");
+            queryDibersihkan = `${cleanedLastMsg} ${queryDibersihkan}`;
         }
 
-        // Lakukan pencarian ke dataset CSV menggunakan query yang sudah diperkaya kata kuncinya
+        // Lakukan pencarian ke dataset CSV menggunakan query yang sudah dibersihkan & diekspansi
         const contextItems = ragEngine.retrieveContext(
             queryDibersihkan,
             allDocuments,
             Number(process.env.RAG_TOP_K || 3)
         );
         
-        console.log(`[Web Chat] RAG Retrieved ${contextItems.length} context(s) untuk kueri perluasan: "${queryDibersihkan}"`);
+        console.log(`[Web Chat] RAG Final Query: "${queryDibersihkan}" -> Retrieved ${contextItems.length} context(s)`);
         
         // 3. JIKA CONTEXT DITEMUKAN / JALUR GROQ LLM
         const timeoutPromise = new Promise((_, reject) =>
