@@ -158,7 +158,7 @@ app.post('/api/chat', async (req, res) => {
         const pesanMasuk = message.toLowerCase().trim();
         let faqResponse = null;
 
-        // 1. GARDA TERDEPAN: Cek Kata Kunci Kaku (knowledge.json)
+        // 1. GARDA TERDEPAN: Cek Kata Kunci Kaku Singkat (Sapaan/Terimakasih/Jam Kerja)
         if (knowledge.keywords && knowledge.responses) {
             for (const [kunciUtama, daftarKata] of Object.entries(knowledge.keywords)) {
                 if (daftarKata.some(kata => pesanMasuk.includes(kata))) {
@@ -173,38 +173,52 @@ app.post('/api/chat', async (req, res) => {
             return res.json({ reply: faqResponse, source: 'FAQ Direct Match' });
         }
 
-        // 2. DETEKSI SAPAAN RINGAN (Mencegah Greeting Loop)
-        // Jika hanya menyapa "halo", "hai", atau "p", langsung jawab tanpa perlu mencari RAG/Groq bengkak
-        const sapaanSederhana = ['halo', 'hai', 'p', 'permisi', 'selamat pagi', 'selamat siang', 'assalamualaikum'];
-        if (sapaanSederhana.includes(pesanMasuk)) {
-            return res.json({ 
-                reply: 'Halo! Ada yang bisa saya bantu terkait informasi administrasi akademik kampus Telkom University Surabaya?', 
-                source: 'Static Greeting' 
-            });
-        }
-
-        // 3. JALUR UTAMA: Ekstraksi Dokumen Menggunakan RAG TF-IDF Lokal
+        // 2. JALUR UTAMA: Ekstraksi Dokumen Menggunakan RAG TF-IDF Lokal
         const allDocuments = datasetManager.getAllDocuments();
         
-        // Ambil riwayat chat terakhir untuk digabungkan ke query agar memahami kata "itu", "tersebut", "ini"
-        let history = chatHistories.get(activeUserId) || [];
-        let contextualQuery = message;
-        
-        // Jika ada percakapan sebelumnya, gabungkan topik terakhir agar TF-IDF Lokal tahu konteksnya
-        if (history.length > 0) {
-            const lastUserMsg = history[history.length - 2]?.content || "";
-            contextualQuery = `${lastUserMsg} ${message}`;
+        // --- FITUR BARU: KAMUS EKSPANSI & SINONIM AKADEMIK TUS ---
+        // Ini memastikan jika mahasiswa mengetik kata kunci pendek, sistem memperluas pencarian di CSV
+        let queryDibersihkan = pesanMasuk;
+        const kamusEkspansi = {
+            "eprt": "eprt toefl bahasa asing skor nilai minimum kelulusan",
+            "tak": "tak transkrip aktivitas kemahasiswaan poin minimal",
+            "yudisium": "yudisium sidang kelulusan ijazah skl fakultas rektor",
+            "wisuda": "syarat lulus kelulusan wisuda ukt lunas publikasi ta",
+            "skripsi": "tugas akhir ta skripsi sidang proposal pembimbing",
+            "ta": "tugas akhir ta skripsi sidang proposal pembimbing",
+            "kp": "magang kerja praktik kp wrap internship",
+            "magang": "magang kerja praktik kp wrap internship",
+            "cuti": "cuti akademik nonaktif bpp status 10 persen tingkat 1",
+            "sks": "beban belajar sks maksimal kuota ip ips ambil krs",
+            "krs": "krs ksm registrasi daftar ulang ukt ksm cetak",
+            "sp": "semester antara pendek sp remedial kelas perkuliahan",
+            "do": "drop out sp surat peringatan evaluasi tingkat do"
+        };
+
+        // Cek jika kueri mengandung komponen kata kunci populer, lalu gabungkan kekayaan katanya
+        for (const [singkatan, deskripsiPanjang] of Object.entries(kamusEkspansi)) {
+            if (queryDibersihkan.includes(singkatan)) {
+                queryDibersihkan = `${queryDibersihkan} ${deskripsiPanjang}`;
+            }
         }
 
+        // Ambil riwayat chat terakhir untuk digabungkan ke query agar memahami kata konteks lanjutan
+        let history = chatHistories.get(activeUserId) || [];
+        if (history.length > 0) {
+            const lastUserMsg = history[history.length - 2]?.content || "";
+            queryDibersihkan = `${lastUserMsg.toLowerCase()} ${queryDibersihkan}`;
+        }
+
+        // Lakukan pencarian ke dataset CSV menggunakan query yang sudah diperkaya kata kuncinya
         const contextItems = ragEngine.retrieveContext(
-            contextualQuery,
+            queryDibersihkan,
             allDocuments,
             Number(process.env.RAG_TOP_K || 3)
         );
         
-        console.log(`[Web Chat] RAG Retrieved ${contextItems.length} context(s) untuk kueri: "${contextualQuery}"`);
+        console.log(`[Web Chat] RAG Retrieved ${contextItems.length} context(s) untuk kueri perluasan: "${queryDibersihkan}"`);
         
-        // 4. KIRIM KE GROQ LLM (Otak utama yang merangkai kalimat)
+        // 3. JIKA CONTEXT DITEMUKAN / JALUR GROQ LLM
         const timeoutPromise = new Promise((_, reject) =>
             setTimeout(() => reject(new Error('AI response timeout')), 20000)
         );
@@ -217,19 +231,18 @@ app.post('/api/chat', async (req, res) => {
                 timeoutPromise
             ]);
 
-            if (aiResponse && !aiResponse.toLowerCase().includes("halo! saya adalah smart chatbot")) {
+            if (aiResponse && aiResponse.trim() !== "") {
                 return res.json({ reply: aiResponse, source: 'RAG Engine + Groq AI' });
             } else {
-                // Jika AI error atau mengembalikan pesan sapaan kosong, berikan fallback solutif
                 return res.json({ 
-                    reply: 'Mohon maaf, saya belum menemukan aturan spesifik mengenai hal tersebut di buku pedoman akademik saat ini. Bisa tolong perjelas pertanyaannya?', 
+                    reply: 'Mohon maaf, saya belum menemukan aturan spesifik mengenai hal tersebut di buku pedoman akademik saat ini. Bisa tolong berikan kata kunci yang lebih jelas?', 
                     source: 'Safe Fallback' 
                 });
             }
         } catch (aiError) {
             console.error('AI Processing Error:', aiError.message);
             return res.json({ 
-                reply: 'Maaf, terjadi antrean komputasi di server AI. Silakan coba kirimkan ulang pertanyaan Anda dalam beberapa saat.', 
+                reply: 'Maaf, sistem AI sedang mengalami antrean komputasi. Silakan coba kirimkan ulang pertanyaan Anda.', 
                 source: 'Timeout Fallback' 
             });
         }
